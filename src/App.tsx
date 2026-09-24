@@ -30,10 +30,31 @@ function MainApp() {
   const [viewParam, setViewParam] = useState<any>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
-  // Global data
-  const [products, setProducts] = useState<Product[]>([]);
-  const [categories, setCategories] = useState<{ id: string; name: string }[]>([]);
-  const [shopSettings, setShopSettings] = useState<ShopSettings | null>(null);
+  // Global data with immediate sessionStorage hydration
+  const [products, setProducts] = useState<Product[]>(() => {
+    try {
+      const saved = sessionStorage.getItem('ak_cached_products');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [categories, setCategories] = useState<{ id: string; name: string }[]>(() => {
+    try {
+      const saved = sessionStorage.getItem('ak_cached_categories');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [shopSettings, setShopSettings] = useState<ShopSettings | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('ak_cached_settings');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
   // Modals
   const [receiptSale, setReceiptSale] = useState<Sale | null>(null);
@@ -46,7 +67,7 @@ function MainApp() {
   const [deletingProduct, setDeletingProduct] = useState<Product | null>(null);
   const [isDeleteProductOpen, setIsDeleteProductOpen] = useState(false);
 
-  // Refresh data
+  // Refresh data in background
   const reloadData = async () => {
     try {
       const [prods, cats, sets] = await Promise.all([
@@ -57,6 +78,11 @@ function MainApp() {
       setProducts(prods);
       setCategories(cats);
       setShopSettings(sets);
+      try {
+        sessionStorage.setItem('ak_cached_products', JSON.stringify(prods));
+        sessionStorage.setItem('ak_cached_categories', JSON.stringify(cats));
+        sessionStorage.setItem('ak_cached_settings', JSON.stringify(sets));
+      } catch {}
     } catch (err) {
       console.error('Failed to reload data:', err);
     }
@@ -193,6 +219,17 @@ function MainApp() {
               categories={categories}
               initialProductId={typeof viewParam === 'string' ? viewParam : undefined}
               onSaleCompleted={sale => {
+                // Deduct sold quantity optimistically from products
+                const soldItem = sale.items?.[0];
+                if (soldItem) {
+                  setProducts(prev =>
+                    prev.map(p =>
+                      p.id === soldItem.product_id
+                        ? { ...p, current_quantity: Math.max(0, (p.current_quantity ?? 0) - soldItem.quantity) }
+                        : p
+                    )
+                  );
+                }
                 reloadData();
               }}
               onOpenReceipt={sale => {
@@ -253,7 +290,9 @@ function MainApp() {
         onClose={() => {
           setIsAddProductOpen(false);
         }}
-        onSuccess={() => {
+        onSuccess={(newProduct) => {
+          // Immediately add to products state for 0ms response
+          setProducts(prev => [newProduct, ...prev]);
           reloadData();
         }}
       />
@@ -267,7 +306,9 @@ function MainApp() {
           setIsEditProductOpen(false);
           setEditingProduct(null);
         }}
-        onSuccess={() => {
+        onSuccess={(updatedProduct) => {
+          // Immediately update in products state for 0ms response
+          setProducts(prev => prev.map(p => p.id === updatedProduct.id ? updatedProduct : p));
           reloadData();
         }}
         onDeleteRequest={prod => {
@@ -285,6 +326,8 @@ function MainApp() {
           setDeletingProduct(null);
         }}
         onSuccess={deletedId => {
+          // Immediately remove from products state for 0ms response
+          setProducts(prev => prev.filter(p => p.id !== deletedId));
           reloadData();
           if (currentView === 'product-details' && viewParam === deletedId) {
             setCurrentView('inventory');

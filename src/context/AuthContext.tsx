@@ -14,13 +14,29 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<AdminUser | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [user, setUser] = useState<AdminUser | null>(() => {
+    try {
+      const token = localStorage.getItem('ak_auth_token');
+      const saved = localStorage.getItem('ak_admin_user');
+      if (token && saved) {
+        return JSON.parse(saved);
+      }
+    } catch {}
+    return null;
+  });
+
+  const [isLoading, setIsLoading] = useState<boolean>(() => {
+    const token = localStorage.getItem('ak_auth_token');
+    const saved = localStorage.getItem('ak_admin_user');
+    // If we already have stored token and user profile, render immediately without blocking!
+    return !(token && saved);
+  });
 
   const checkAuth = async () => {
     const token = api.getToken();
     if (!token) {
       setUser(null);
+      localStorage.removeItem('ak_admin_user');
       setIsLoading(false);
       return;
     }
@@ -28,8 +44,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await api.getMe();
       setUser(res.admin);
+      localStorage.setItem('ak_admin_user', JSON.stringify(res.admin));
     } catch {
       setUser(null);
+      localStorage.removeItem('ak_admin_user');
       api.setToken(null);
     } finally {
       setIsLoading(false);
@@ -41,6 +59,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const handleExpired = () => {
       setUser(null);
+      localStorage.removeItem('ak_admin_user');
     };
 
     window.addEventListener('auth:expired', handleExpired);
@@ -52,6 +71,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await api.login(email, password);
       setUser(res.admin);
+      localStorage.setItem('ak_admin_user', JSON.stringify(res.admin));
     } finally {
       setIsLoading(false);
     }
@@ -64,6 +84,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error('Logout error:', err);
     } finally {
       setUser(null);
+      localStorage.removeItem('ak_admin_user');
     }
   };
 
@@ -71,8 +92,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await api.getMe();
       setUser(res.admin);
+      localStorage.setItem('ak_admin_user', JSON.stringify(res.admin));
     } catch {
       setUser(null);
+      localStorage.removeItem('ak_admin_user');
     }
   };
 

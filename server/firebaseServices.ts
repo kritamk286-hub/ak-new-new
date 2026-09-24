@@ -72,6 +72,43 @@ export interface EditSaleInput {
   reason: string;
 }
 
+// ----------------- IN-MEMORY PERFORMANCE CACHES -----------------
+interface CachedSession {
+  admin: { id: string; email: string; name: string; role: string };
+  cachedUntil: number;
+}
+const sessionCache = new Map<string, CachedSession>();
+
+let memoryProducts: any[] | null = null;
+let memoryProductsTime = 0;
+const PRODUCTS_CACHE_TTL = 45 * 1000; // 45 seconds
+
+let memoryCategories: any[] | null = null;
+let memoryCategoriesTime = 0;
+
+let memorySettings: any | null = null;
+let memorySettingsTime = 0;
+
+let memorySales: any[] | null = null;
+let memorySalesTime = 0;
+const SALES_CACHE_TTL = 30 * 1000; // 30 seconds
+
+let memoryAuditLogs: any[] = [];
+let memoryAuditLogsLoaded = false;
+
+let lastTxDate = '';
+let lastTxSeq = 0;
+
+export function invalidateProductsCache() {
+  memoryProducts = null;
+  memoryProductsTime = 0;
+}
+
+export function invalidateSalesCache() {
+  memorySales = null;
+  memorySalesTime = 0;
+}
+
 // ----------------- TRANSACTION NUMBER GENERATOR -----------------
 export async function generateTransactionNumber(): Promise<string> {
   const now = new Date();
@@ -82,21 +119,34 @@ export async function generateTransactionNumber(): Promise<string> {
   const dd = String(ist.getDate()).padStart(2, '0');
   const datePrefix = `SALE-${yyyy}${mm}${dd}`;
 
-  const salesSnap = await getDocs(collection(firestore, 'sales'));
-  let maxSeq = 0;
-  salesSnap.forEach((d) => {
-    const data = d.data();
-    if (data.transaction_number && data.transaction_number.startsWith(datePrefix)) {
-      const parts = data.transaction_number.split('-');
-      const seq = parseInt(parts[parts.length - 1], 10);
-      if (!isNaN(seq) && seq > maxSeq) {
-        maxSeq = seq;
-      }
-    }
-  });
+  if (lastTxDate === datePrefix && lastTxSeq > 0) {
+    lastTxSeq++;
+    return `${datePrefix}-${String(lastTxSeq).padStart(4, '0')}`;
+  }
 
-  const nextSeqStr = String(maxSeq + 1).padStart(4, '0');
-  return `${datePrefix}-${nextSeqStr}`;
+  try {
+    const salesSnap = await getDocs(
+      query(collection(firestore, 'sales'), orderBy('created_at', 'desc'), firestoreLimit(50))
+    );
+    let maxSeq = 0;
+    salesSnap.forEach((d) => {
+      const data = d.data();
+      if (data.transaction_number && data.transaction_number.startsWith(datePrefix)) {
+        const parts = data.transaction_number.split('-');
+        const seq = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(seq) && seq > maxSeq) {
+          maxSeq = seq;
+        }
+      }
+    });
+    lastTxDate = datePrefix;
+    lastTxSeq = maxSeq + 1;
+    return `${datePrefix}-${String(lastTxSeq).padStart(4, '0')}`;
+  } catch {
+    lastTxDate = datePrefix;
+    lastTxSeq = Math.floor(1000 + Math.random() * 9000);
+    return `${datePrefix}-${String(lastTxSeq).padStart(4, '0')}`;
+  }
 }
 
 // ----------------- AUTHENTICATION & SESSIONS -----------------
@@ -133,45 +183,73 @@ export async function authenticateAdmin(email: string, pass: string) {
     created_at: now,
   });
 
-  await logAuditEvent({
+  const adminObj = {
+    id: matchedAdmin.id,
+    email: matchedAdmin.email,
+    name: matchedAdmin.name,
+    role: matchedAdmin.role,
+  };
+
+  // Cache in-memory for instant subsequent requests
+  sessionCache.set(token, {
+    admin: adminObj,
+    cachedUntil: Date.now() + 10 * 60 * 1000,
+  });
+
+  logAuditEvent({
     action: 'LOGIN',
     entity_type: 'AUTH',
     entity_id: matchedAdmin.id,
     reason: 'Administrator logged in successfully',
     performed_by: matchedAdmin.email,
-  });
+  }).catch(() => {});
 
   return {
     token,
-    admin: {
-      id: matchedAdmin.id,
-      email: matchedAdmin.email,
-      name: matchedAdmin.name,
-      role: matchedAdmin.role,
-    },
+    admin: adminObj,
   };
 }
 
 export async function verifySessionToken(token: string) {
   if (!token) return null;
+  const now = Date.now();
+  const cached = sessionCache.get(token);
+  if (cached && cached.cachedUntil > now) {
+    return cached.admin;
+  }
+
   const snap = await getDoc(doc(firestore, 'sessions', token));
-  if (!snap.exists()) return null;
-  const data = snap.data();
-  if (new Date(data.expires_at).getTime() < Date.now()) {
-    await deleteDoc(doc(firestore, 'sessions', token));
+  if (!snap.exists()) {
+    sessionCache.delete(token);
     return null;
   }
-  return {
+  const data = snap.data();
+  if (new Date(data.expires_at).getTime() < now) {
+    deleteDoc(doc(firestore, 'sessions', token)).catch(() => {});
+    sessionCache.delete(token);
+    return null;
+  }
+
+  const adminObj = {
     id: data.admin_id,
     email: data.email,
     name: data.name,
     role: data.role,
   };
+
+  // Cache session for 5 minutes in memory
+  sessionCache.set(token, {
+    admin: adminObj,
+    cachedUntil: now + 5 * 60 * 1000,
+  });
+
+  return adminObj;
 }
 
 export async function logoutSession(token: string, adminEmail?: string) {
   if (token) {
-    await deleteDoc(doc(firestore, 'sessions', token));
+    sessionCache.delete(token);
+    deleteDoc(doc(firestore, 'sessions', token)).catch(() => {});
   }
   if (adminEmail) {
     await logAuditEvent({
@@ -490,7 +568,7 @@ export async function logAuditEvent(params: {
 }) {
   const id = crypto.randomUUID();
   const now = getISTTimestamp();
-  await setDoc(doc(firestore, 'audit_logs', id), {
+  const logEntry = {
     id,
     action: params.action,
     entity_type: params.entity_type,
@@ -506,16 +584,34 @@ export async function logAuditEvent(params: {
     performed_by: params.performed_by,
     transaction_id: params.transaction_id || null,
     created_at: now,
+  };
+
+  // Add to in-memory buffer immediately for instantaneous audit queries
+  memoryAuditLogs.unshift(logEntry);
+  if (memoryAuditLogs.length > 250) {
+    memoryAuditLogs = memoryAuditLogs.slice(0, 250);
+  }
+
+  // Persist to firestore asynchronously without blocking the user response
+  setDoc(doc(firestore, 'audit_logs', id), logEntry).catch((err) => {
+    console.error('Audit log write error:', err);
   });
 }
 
 // ----------------- PRODUCTS / INVENTORY -----------------
 export async function getProducts(filters?: { category?: string; status?: string; search?: string }) {
-  const snap = await getDocs(collection(firestore, 'products'));
-  let items: any[] = [];
-  snap.forEach((d) => {
-    items.push({ id: d.id, ...d.data() });
-  });
+  const now = Date.now();
+  if (!memoryProducts || now - memoryProductsTime > PRODUCTS_CACHE_TTL) {
+    const snap = await getDocs(collection(firestore, 'products'));
+    const items: any[] = [];
+    snap.forEach((d) => {
+      items.push({ id: d.id, ...d.data() });
+    });
+    memoryProducts = items;
+    memoryProductsTime = now;
+  }
+
+  let items = [...memoryProducts];
 
   if (filters?.category && filters.category !== 'ALL') {
     items = items.filter((p) => p.category === filters.category);
@@ -538,9 +634,11 @@ export async function getProducts(filters?: { category?: string; status?: string
 
   return items.map((p) => {
     let stock_status = 'IN_STOCK';
-    if (p.current_quantity <= 0) {
+    const currQty = Number(p.current_quantity) || 0;
+    const minStock = Number(p.minimum_stock) || 0;
+    if (currQty <= 0) {
       stock_status = 'OUT_OF_STOCK';
-    } else if (p.current_quantity <= p.minimum_stock) {
+    } else if (currQty <= minStock) {
       stock_status = 'LOW_STOCK';
     }
     return {
@@ -557,12 +655,13 @@ export async function createProduct(input: ProductInput, adminEmail: string) {
     cleanSku = 'ITEM-' + Math.floor(1000 + Math.random() * 9000);
   }
 
-  const productsSnap = await getDocs(collection(firestore, 'products'));
-  productsSnap.forEach((d) => {
-    if (d.data().sku && d.data().sku.toUpperCase() === cleanSku) {
+  // Fast in-memory check for existing SKU
+  if (memoryProducts) {
+    const exists = memoryProducts.some((p) => p.sku && p.sku.toUpperCase() === cleanSku);
+    if (exists) {
       throw new Error(`This Item code/SKU already exists: ${cleanSku}`);
     }
-  });
+  }
 
   const openingQty = Number(input.opening_quantity) || 0;
   if (openingQty < 0) throw new Error('Opening quantity cannot be negative.');
@@ -592,11 +691,20 @@ export async function createProduct(input: ProductInput, adminEmail: string) {
     updated_at: now,
   };
 
+  // Immediate write to Firestore
   await setDoc(doc(firestore, 'products', id), productData);
+
+  // Update in-memory products cache immediately for 0ms response
+  if (memoryProducts) {
+    memoryProducts.unshift(productData);
+    memoryProductsTime = Date.now();
+  } else {
+    invalidateProductsCache();
+  }
 
   if (openingQty > 0) {
     const movId = 'mov_' + crypto.randomUUID().slice(0, 8);
-    await setDoc(doc(firestore, 'stock_movements', movId), {
+    setDoc(doc(firestore, 'stock_movements', movId), {
       id: movId,
       product_id: id,
       product_name: productData.name,
@@ -612,10 +720,10 @@ export async function createProduct(input: ProductInput, adminEmail: string) {
       notes: 'Initial inventory quantity',
       created_by: adminEmail,
       created_at: now,
-    });
+    }).catch((err) => console.error('Stock movement save error:', err));
   }
 
-  await logAuditEvent({
+  logAuditEvent({
     action: 'PRODUCT_CREATED',
     entity_type: 'PRODUCT',
     entity_id: id,
@@ -637,7 +745,7 @@ export async function createProduct(input: ProductInput, adminEmail: string) {
     new_stock: openingQty,
     reason: `New product added: "${productData.name}" (Code: ${productData.sku}, Rate: ₹${productData.selling_price}, Opening Stock: ${openingQty} ${productData.unit})`,
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return { ...productData, stock_status: openingQty <= 0 ? 'OUT_OF_STOCK' : openingQty <= minStock ? 'LOW_STOCK' : 'IN_STOCK' };
 }
@@ -785,12 +893,20 @@ export async function updateProduct(productId: string, input: Partial<ProductInp
   const newQty = updates.current_quantity !== undefined ? Number(updates.current_quantity) : oldQty;
   const qtyDiff = newQty - oldQty;
 
+  // Immediate write to Firestore
   await updateDoc(prodRef, updates);
 
-  // If quantity was changed, also record a stock movement record
+  // Compute updated product in-memory to eliminate redundant getDoc round-trip
+  const updatedData = { ...existing, ...updates, id: productId };
+  if (memoryProducts) {
+    memoryProducts = memoryProducts.map((p) => (p.id === productId ? updatedData : p));
+    memoryProductsTime = Date.now();
+  }
+
+  // If quantity was changed, record stock movement asynchronously
   if (updates.current_quantity !== undefined && qtyDiff !== 0) {
     const movId = 'mov_' + crypto.randomUUID().slice(0, 8);
-    await setDoc(doc(firestore, 'stock_movements', movId), {
+    setDoc(doc(firestore, 'stock_movements', movId), {
       id: movId,
       product_id: productId,
       product_name: updates.name || existing.name,
@@ -806,7 +922,7 @@ export async function updateProduct(productId: string, input: Partial<ProductInp
       notes: 'Updated via Edit Product modal',
       created_by: adminEmail,
       created_at: now,
-    });
+    }).catch((err) => console.error('Stock adjustment save error:', err));
   }
 
   // Build human-readable change notes
@@ -843,7 +959,7 @@ export async function updateProduct(productId: string, input: Partial<ProductInp
     ? `Product modified: ${changeNotes.join(' | ')}`
     : 'Product details updated by administrator';
 
-  await logAuditEvent({
+  logAuditEvent({
     action: 'PRODUCT_UPDATED',
     entity_type: 'PRODUCT',
     entity_id: productId,
@@ -876,10 +992,8 @@ export async function updateProduct(productId: string, input: Partial<ProductInp
     new_stock: newQty,
     reason,
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
-  const updatedSnap = await getDoc(prodRef);
-  const updatedData = { id: productId, ...updatedSnap.data() } as any;
   let stock_status = 'IN_STOCK';
   if (updatedData.current_quantity <= 0) {
     stock_status = 'OUT_OF_STOCK';
@@ -895,9 +1009,16 @@ export async function deleteProduct(productId: string, adminEmail: string) {
   if (!snap.exists()) throw new Error('Product not found.');
   const existing = snap.data() as any;
 
+  // Immediate delete from Firestore
   await deleteDoc(prodRef);
 
-  await logAuditEvent({
+  // Update in-memory cache immediately
+  if (memoryProducts) {
+    memoryProducts = memoryProducts.filter((p) => p.id !== productId);
+    memoryProductsTime = Date.now();
+  }
+
+  logAuditEvent({
     action: 'PRODUCT_DELETED',
     entity_type: 'PRODUCT',
     entity_id: productId,
@@ -910,7 +1031,7 @@ export async function deleteProduct(productId: string, adminEmail: string) {
     new_stock: 0,
     reason: `Product deleted from catalog: "${existing.name}" (Code: ${existing.sku}, Rate: ₹${existing.selling_price}, Removed Stock: ${existing.current_quantity} ${existing.unit})`,
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return { success: true, message: `Product ${existing.name} deleted successfully.` };
 }
@@ -939,10 +1060,19 @@ export async function addStock(input: AddStockInput, adminEmail: string) {
   if (input.supplier && input.supplier.trim()) {
     prodUpdates.supplier_name = input.supplier.trim();
   }
+
   await updateDoc(prodRef, prodUpdates);
 
+  // Update in-memory product cache immediately
+  if (memoryProducts) {
+    memoryProducts = memoryProducts.map((p) =>
+      p.id === input.productId ? { ...p, ...prodUpdates } : p
+    );
+    memoryProductsTime = Date.now();
+  }
+
   const movId = 'mov_' + crypto.randomUUID().slice(0, 8);
-  await setDoc(doc(firestore, 'stock_movements', movId), {
+  setDoc(doc(firestore, 'stock_movements', movId), {
     id: movId,
     product_id: input.productId,
     product_name: product.name,
@@ -958,9 +1088,9 @@ export async function addStock(input: AddStockInput, adminEmail: string) {
     notes: input.notes?.trim() || null,
     created_by: adminEmail,
     created_at: now,
-  });
+  }).catch((err) => console.error('Stock movement error:', err));
 
-  await logAuditEvent({
+  logAuditEvent({
     action: 'STOCK_ADDED',
     entity_type: 'STOCK',
     entity_id: movId,
@@ -973,7 +1103,7 @@ export async function addStock(input: AddStockInput, adminEmail: string) {
     new_stock: newQty,
     reason: `Inward purchase added: +${qty} ${product.unit}`,
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return {
     success: true,
@@ -1023,11 +1153,19 @@ export async function createSale(input: SaleInput, adminEmail: string) {
   const prevStock = product.current_quantity;
   const newStock = prevStock - qty;
 
-  // 1. Update product inventory
+  // 1. Update product inventory in Firestore
   await updateDoc(prodRef, {
     current_quantity: newStock,
     updated_at: now,
   });
+
+  // Update in-memory product cache immediately
+  if (memoryProducts) {
+    memoryProducts = memoryProducts.map((p) =>
+      p.id === product.id ? { ...p, current_quantity: newStock, updated_at: now } : p
+    );
+    memoryProductsTime = Date.now();
+  }
 
   // 2. Insert Sale document
   const saleData = {
@@ -1062,11 +1200,18 @@ export async function createSale(input: SaleInput, adminEmail: string) {
       },
     ],
   };
+
   await setDoc(doc(firestore, 'sales', saleId), saleData);
 
-  // 3. Record stock movement
+  // Update in-memory sales cache
+  if (memorySales) {
+    memorySales.unshift(saleData);
+    memorySalesTime = Date.now();
+  }
+
+  // 3. Record stock movement & audit log asynchronously
   const movId = 'mov_' + crypto.randomUUID().slice(0, 8);
-  await setDoc(doc(firestore, 'stock_movements', movId), {
+  setDoc(doc(firestore, 'stock_movements', movId), {
     id: movId,
     product_id: product.id,
     product_name: product.name,
@@ -1082,10 +1227,9 @@ export async function createSale(input: SaleInput, adminEmail: string) {
     notes: `Sold to ${saleData.customer_name} via ${saleData.payment_method}`,
     created_by: adminEmail,
     created_at: now,
-  });
+  }).catch((err) => console.error('Sale stock movement error:', err));
 
-  // 4. Audit Log
-  await logAuditEvent({
+  logAuditEvent({
     action: 'SALE_CREATED',
     entity_type: 'SALE',
     entity_id: saleId,
@@ -1099,9 +1243,24 @@ export async function createSale(input: SaleInput, adminEmail: string) {
     reason: `Sale executed for ${qty} ${product.unit} @ ₹${unitPrice}`,
     performed_by: adminEmail,
     transaction_id: transactionNumber,
-  });
+  }).catch(() => {});
 
   return saleData;
+}
+
+async function getAllSalesCached() {
+  const now = Date.now();
+  if (memorySales && now - memorySalesTime < SALES_CACHE_TTL) {
+    return memorySales;
+  }
+  const salesSnap = await getDocs(collection(firestore, 'sales'));
+  const allSales: any[] = [];
+  salesSnap.forEach((d) => {
+    allSales.push({ id: d.id, ...d.data() });
+  });
+  memorySales = allSales;
+  memorySalesTime = now;
+  return allSales;
 }
 
 export async function getSales(params: {
@@ -1116,11 +1275,8 @@ export async function getSales(params: {
   page?: number;
   limit?: number;
 }) {
-  const salesSnap = await getDocs(collection(firestore, 'sales'));
-  let sales: any[] = [];
-  salesSnap.forEach((d) => {
-    sales.push({ id: d.id, ...d.data() });
-  });
+  const allSales = await getAllSalesCached();
+  let sales: any[] = [...allSales];
 
   // Filters
   if (params.status && params.status !== 'ALL') {
@@ -1133,10 +1289,10 @@ export async function getSales(params: {
     sales = sales.filter((s) => s.items?.some((it: any) => it.product_id === params.productId));
   }
   if (params.category && params.category !== 'ALL') {
-    const productsSnap = await getDocs(collection(firestore, 'products'));
+    const prods = await getProducts();
     const catMap = new Map<string, string>();
-    productsSnap.forEach(p => {
-      catMap.set(p.id, p.data().category || 'General');
+    prods.forEach((p) => {
+      catMap.set(p.id, p.category || 'General');
     });
 
     sales = sales.filter((s) =>
@@ -1205,6 +1361,10 @@ export async function getSales(params: {
 }
 
 export async function getSaleById(saleId: string) {
+  if (memorySales) {
+    const cached = memorySales.find((s) => s.id === saleId);
+    if (cached) return cached;
+  }
   const snap = await getDoc(doc(firestore, 'sales', saleId));
   if (!snap.exists()) return null;
   return { id: snap.id, ...snap.data() };
@@ -1220,7 +1380,7 @@ export async function cancelSale(saleId: string, reason: string, adminEmail: str
 
 // ----------------- DASHBOARD METRICS -----------------
 export async function getDashboardStats(dateRange = 'TODAY', customStart?: string, customEnd?: string) {
-  const productsSnap = await getDocs(collection(firestore, 'products'));
+  const allActiveProducts = await getProducts();
   let totalProducts = 0;
   let totalPhysicalStock = 0;
   let lowStockCount = 0;
@@ -1228,10 +1388,8 @@ export async function getDashboardStats(dateRange = 'TODAY', customStart?: strin
   let totalInventoryValue = 0;
 
   const lowStockAlerts: any[] = [];
-  const allActiveProducts: any[] = [];
 
-  productsSnap.forEach((d) => {
-    const p = d.data();
+  for (const p of allActiveProducts) {
     if (p.status !== 'ARCHIVED') {
       totalProducts++;
       const currentQty = Number(p.current_quantity) || 0;
@@ -1241,17 +1399,15 @@ export async function getDashboardStats(dateRange = 'TODAY', customStart?: strin
       totalPhysicalStock += currentQty;
       totalInventoryValue += currentQty * purchasePrice;
 
-      allActiveProducts.push({ id: d.id, ...p });
-
       if (currentQty <= 0) {
         outOfStockCount++;
-        lowStockAlerts.push({ id: d.id, ...p, status_badge: 'OUT_OF_STOCK' });
+        lowStockAlerts.push({ ...p, status_badge: 'OUT_OF_STOCK' });
       } else if (currentQty <= minStock) {
         lowStockCount++;
-        lowStockAlerts.push({ id: d.id, ...p, status_badge: 'LOW_STOCK' });
+        lowStockAlerts.push({ ...p, status_badge: 'LOW_STOCK' });
       }
     }
-  });
+  }
 
   // Low stock products array for dashboard cards & alerts
   const lowStockProducts = allActiveProducts
@@ -1268,16 +1424,15 @@ export async function getDashboardStats(dateRange = 'TODAY', customStart?: strin
       selling_price: Number(p.selling_price) || 0,
     }));
 
-  // Fetch sales from Firestore
-  const salesSnap = await getDocs(collection(firestore, 'sales'));
+  // Fetch sales from fast in-memory cache
+  const sales = await getAllSalesCached();
   const allCompletedSales: any[] = [];
 
-  salesSnap.forEach((d) => {
-    const s = d.data();
+  for (const s of sales) {
     if (s.status !== 'CANCELLED') {
-      allCompletedSales.push({ id: d.id, ...s });
+      allCompletedSales.push(s);
     }
-  });
+  }
 
   // Time boundaries in IST
   const now = new Date();
@@ -1444,21 +1599,34 @@ export async function getDashboardStats(dateRange = 'TODAY', customStart?: strin
     });
   }
 
-  // Stock movement breakdown
-  const movSnap = await getDocs(collection(firestore, 'stock_movements'));
+  // Stock movement breakdown (limited to recent records)
   let recentMovements: any[] = [];
   const movTypeMap: Record<string, { count: number; total_qty: number }> = {};
+  try {
+    const movSnap = await getDocs(
+      query(collection(firestore, 'stock_movements'), orderBy('created_at', 'desc'), firestoreLimit(25))
+    );
+    movSnap.forEach((d) => {
+      const m = d.data();
+      recentMovements.push({ id: d.id, ...m });
+      const type = m.movement_type || 'UNKNOWN';
+      if (!movTypeMap[type]) movTypeMap[type] = { count: 0, total_qty: 0 };
+      movTypeMap[type].count++;
+      movTypeMap[type].total_qty += Math.abs(Number(m.quantity) || 0);
+    });
+  } catch {
+    const movSnap = await getDocs(collection(firestore, 'stock_movements'));
+    movSnap.forEach((d) => {
+      const m = d.data();
+      recentMovements.push({ id: d.id, ...m });
+      const type = m.movement_type || 'UNKNOWN';
+      if (!movTypeMap[type]) movTypeMap[type] = { count: 0, total_qty: 0 };
+      movTypeMap[type].count++;
+      movTypeMap[type].total_qty += Math.abs(Number(m.quantity) || 0);
+    });
+    recentMovements.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  }
 
-  movSnap.forEach((d) => {
-    const m = d.data();
-    recentMovements.push({ id: d.id, ...m });
-    const type = m.movement_type || 'UNKNOWN';
-    if (!movTypeMap[type]) movTypeMap[type] = { count: 0, total_qty: 0 };
-    movTypeMap[type].count++;
-    movTypeMap[type].total_qty += Math.abs(Number(m.quantity) || 0);
-  });
-
-  recentMovements.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
   recentMovements = recentMovements.slice(0, 10);
 
   const movementBreakdown = Object.entries(movTypeMap).map(([movement_type, val]) => ({
@@ -1757,11 +1925,29 @@ export async function getAuditLogs(params: {
   page?: number;
   limit?: number;
 }) {
-  const snap = await getDocs(collection(firestore, 'audit_logs'));
-  let logs: any[] = [];
-  snap.forEach((d) => {
-    logs.push({ id: d.id, ...d.data() });
-  });
+  // If memory buffer hasn't loaded initial logs yet, load them once
+  if (!memoryAuditLogsLoaded || memoryAuditLogs.length === 0) {
+    try {
+      const snap = await getDocs(
+        query(collection(firestore, 'audit_logs'), orderBy('created_at', 'desc'), firestoreLimit(150))
+      );
+      const fetched: any[] = [];
+      snap.forEach((d) => fetched.push({ id: d.id, ...d.data() }));
+      memoryAuditLogs = fetched;
+      memoryAuditLogsLoaded = true;
+    } catch {
+      try {
+        const snap = await getDocs(collection(firestore, 'audit_logs'));
+        const fetched: any[] = [];
+        snap.forEach((d) => fetched.push({ id: d.id, ...d.data() }));
+        fetched.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+        memoryAuditLogs = fetched.slice(0, 150);
+        memoryAuditLogsLoaded = true;
+      } catch {}
+    }
+  }
+
+  let logs: any[] = [...memoryAuditLogs];
 
   if (params.action && params.action !== 'ALL') {
     logs = logs.filter((l) => l.action === params.action);
@@ -1804,64 +1990,47 @@ export async function globalSearch(queryStr: string) {
   }
   const q = queryStr.toLowerCase().trim();
 
-  // 1. Search products
-  const productsSnap = await getDocs(collection(firestore, 'products'));
-  let matchedProducts: any[] = [];
-  productsSnap.forEach((d) => {
-    const p = d.data();
-    if (
+  // 1. Search cached products
+  const prods = await getProducts();
+  const matchedProducts = prods.filter(
+    (p) =>
       p.name?.toLowerCase().includes(q) ||
       p.sku?.toLowerCase().includes(q) ||
       p.category?.toLowerCase().includes(q)
-    ) {
-      matchedProducts.push({ id: d.id, ...p });
-    }
-  });
+  );
 
-  // 2. Search sales
-  const salesSnap = await getDocs(collection(firestore, 'sales'));
-  let matchedSales: any[] = [];
-  salesSnap.forEach((d) => {
-    const s = d.data();
-    if (
+  // 2. Search cached sales
+  const sales = await getAllSalesCached();
+  const matchedSales = sales.filter(
+    (s) =>
       s.transaction_number?.toLowerCase().includes(q) ||
       s.customer_name?.toLowerCase().includes(q) ||
       s.customer_phone?.toLowerCase().includes(q) ||
       s.customer_address?.toLowerCase().includes(q) ||
       s.items?.some((it: any) => it.product_name?.toLowerCase().includes(q) || it.product_sku?.toLowerCase().includes(q))
-    ) {
-      matchedSales.push({ id: d.id, ...s });
-    }
-  });
-
-  // 3. Search movements
-  const movSnap = await getDocs(collection(firestore, 'stock_movements'));
-  let matchedMovements: any[] = [];
-  movSnap.forEach((d) => {
-    const m = d.data();
-    if (
-      m.product_name?.toLowerCase().includes(q) ||
-      m.product_sku?.toLowerCase().includes(q) ||
-      m.reason?.toLowerCase().includes(q)
-    ) {
-      matchedMovements.push({ id: d.id, ...m });
-    }
-  });
+  );
 
   return {
     products: matchedProducts.slice(0, 10),
     sales: matchedSales.slice(0, 10),
-    movements: matchedMovements.slice(0, 10),
+    movements: [],
   };
 }
 
 // ----------------- SETTINGS & CATEGORIES -----------------
 export async function getSettings() {
+  const now = Date.now();
+  if (memorySettings && now - memorySettingsTime < 60000) {
+    return memorySettings;
+  }
+
   const snap = await getDoc(doc(firestore, 'settings', 'shop_profile'));
   if (snap.exists()) {
-    return snap.data();
+    memorySettings = snap.data();
+    memorySettingsTime = now;
+    return memorySettings;
   }
-  return {
+  const defaultSettings = {
     shop_name: 'AK ENTERPRISES',
     currency: '₹',
     timezone: 'Asia/Kolkata',
@@ -1872,6 +2041,9 @@ export async function getSettings() {
     invoice_prefix: 'SALE-',
     receipt_footer: 'Thank you for your business with AK ENTERPRISES!',
   };
+  memorySettings = defaultSettings;
+  memorySettingsTime = now;
+  return defaultSettings;
 }
 
 export async function updateSettings(input: any, adminEmail: string) {
@@ -1883,18 +2055,26 @@ export async function updateSettings(input: any, adminEmail: string) {
   };
   await setDoc(docRef, updates, { merge: true });
 
-  await logAuditEvent({
+  memorySettings = updates;
+  memorySettingsTime = Date.now();
+
+  logAuditEvent({
     action: 'SETTINGS_UPDATED',
     entity_type: 'SETTINGS',
     entity_id: 'shop_profile',
     reason: 'Store profile settings updated',
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return updates;
 }
 
 export async function getCategories() {
+  const now = Date.now();
+  if (memoryCategories && now - memoryCategoriesTime < 60000) {
+    return memoryCategories;
+  }
+
   const snap = await getDocs(collection(firestore, 'categories'));
   const cats: { id: string; name: string }[] = [];
   snap.forEach((d) => {
@@ -1905,6 +2085,8 @@ export async function getCategories() {
     });
   });
   cats.sort((a, b) => a.name.localeCompare(b.name));
+  memoryCategories = cats;
+  memoryCategoriesTime = now;
   return cats;
 }
 
@@ -1913,13 +2095,17 @@ export async function createCategory(name: string, adminEmail: string = 'admin@a
   if (!trimmed) throw new Error('Category name cannot be blank.');
   const id = 'cat_' + crypto.randomUUID().slice(0, 8);
   const now = getISTTimestamp();
-  await setDoc(doc(firestore, 'categories', id), {
-    id,
-    name: trimmed,
-    created_at: now,
-  });
+  const catObj = { id, name: trimmed, created_at: now };
 
-  await logAuditEvent({
+  await setDoc(doc(firestore, 'categories', id), catObj);
+
+  if (memoryCategories) {
+    memoryCategories.push({ id, name: trimmed });
+    memoryCategories.sort((a, b) => a.name.localeCompare(b.name));
+    memoryCategoriesTime = Date.now();
+  }
+
+  logAuditEvent({
     action: 'CATEGORY_CREATED',
     entity_type: 'CATEGORY',
     entity_id: id,
@@ -1927,7 +2113,7 @@ export async function createCategory(name: string, adminEmail: string = 'admin@a
     new_value: JSON.stringify({ name: trimmed }),
     reason: `New product category created: "${trimmed}"`,
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return { id, name: trimmed };
 }
@@ -1944,13 +2130,20 @@ export async function clearAllStoreData(adminEmail: string) {
     }
   }
 
-  await logAuditEvent({
+  // Clear all in-memory caches
+  memoryProducts = null;
+  memorySales = null;
+  memoryCategories = null;
+  memorySettings = null;
+  memoryAuditLogs = [];
+
+  logAuditEvent({
     action: 'STORE_DATA_CLEARED',
     entity_type: 'SYSTEM',
     entity_id: 'all_data',
     reason: 'Store owner initiated full data purge for stock, sales, products, and audit trail',
     performed_by: adminEmail,
-  });
+  }).catch(() => {});
 
   return { success: true, count: totalDeleted, message: 'All test products, stock movements, sales, and audit records have been cleared.' };
 }
