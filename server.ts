@@ -74,16 +74,39 @@ app.get('/api/health', (req, res) => {
 });
 
 // ----------------- AUTH ROUTES -----------------
+// In-memory brute force protection
+const loginAttempts = new Map<string, { count: number; lockedUntil?: number }>();
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
 
+  const clientKey = `${req.ip}_${(email || '').trim().toLowerCase()}`;
+  const now = Date.now();
+  const attempt = loginAttempts.get(clientKey);
+
+  if (attempt && attempt.lockedUntil && attempt.lockedUntil > now) {
+    const remainingSeconds = Math.ceil((attempt.lockedUntil - now) / 1000);
+    return res.status(429).json({
+      error: `बहुत अधिक असफल प्रयास (Too many failed attempts). कृपया ${remainingSeconds} सेकंड बाद पुनः प्रयास करें।`,
+    });
+  }
+
   try {
     const result = await services.authenticateAdmin(email, password);
+    // Reset failed attempts on successful login
+    loginAttempts.delete(clientKey);
     res.json(result);
   } catch (err: any) {
+    const current = loginAttempts.get(clientKey) || { count: 0 };
+    current.count += 1;
+    if (current.count >= 5) {
+      current.lockedUntil = now + 5 * 60 * 1000; // 5 minute lock
+    }
+    loginAttempts.set(clientKey, current);
+
     res.status(401).json({ error: err.message || 'Invalid email or password.' });
   }
 });

@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Lock, Mail, AlertCircle, ArrowRight, CheckCircle2 } from 'lucide-react';
+import { ShieldCheck, Lock, Mail, AlertCircle, ArrowRight, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 export const LoginView: React.FC = () => {
   const { login } = useAuth();
-  const [email, setEmail] = useState('kritamk286@gmail.com');
-  const [password, setPassword] = useState('kritam@098only');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -21,12 +22,6 @@ export const LoginView: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleFillAdmin = () => {
-    setEmail('kritamk286@gmail.com');
-    setPassword('kritam@098only');
-    setError(null);
   };
 
   return (
@@ -54,7 +49,7 @@ export const LoginView: React.FC = () => {
           <div className="mb-5 flex items-center justify-between pb-3 border-b border-slate-800">
             <div>
               <h2 className="text-base font-bold text-white">व्यवस्थापक प्रवेश (Admin Sign In)</h2>
-              <p className="text-xs text-slate-400">अधिकृत व्यवस्थापक ईमेल एवं पासवर्ड द्वारा लॉगिन</p>
+              <p className="text-xs text-slate-400">अधिकृत व्यवस्थापक ईमेल एवं पासवर्ड द्वारा सुरक्षित लॉगिन</p>
             </div>
             <ShieldCheck className="w-6 h-6 text-blue-500" />
           </div>
@@ -70,17 +65,20 @@ export const LoginView: React.FC = () => {
             </div>
           )}
 
-          {/* Regular Fast Email / Password Form */}
+          {/* Secure Email / Password Form */}
           <form onSubmit={handleSubmit} className="space-y-4 text-xs">
             <div>
-              <label className="block font-semibold text-slate-300 mb-1.5">ईमेल पता (Email Address)</label>
+              <label htmlFor="login-email-input" className="block font-semibold text-slate-300 mb-1.5">
+                ईमेल पता (Email Address)
+              </label>
               <div className="relative">
-                <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   id="login-email-input"
                   type="email"
                   required
-                  placeholder="kritamk286@gmail.com"
+                  autoComplete="email"
+                  placeholder="name@company.com"
                   value={email}
                   onChange={e => setEmail(e.target.value)}
                   className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder:text-slate-600 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 focus:outline-hidden text-xs transition-colors font-medium"
@@ -89,18 +87,29 @@ export const LoginView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block font-semibold text-slate-300 mb-1.5">पासवर्ड (Password)</label>
+              <label htmlFor="login-password-input" className="block font-semibold text-slate-300 mb-1.5">
+                पासवर्ड (Password)
+              </label>
               <div className="relative">
-                <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   id="login-password-input"
-                  type="password"
+                  type={showPassword ? 'text' : 'password'}
                   required
-                  placeholder="••••••••"
+                  autoComplete="current-password"
+                  placeholder="••••••••••••"
                   value={password}
                   onChange={e => setPassword(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder:text-slate-600 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 focus:outline-hidden text-xs transition-colors"
+                  className="w-full pl-9 pr-10 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder:text-slate-600 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 focus:outline-hidden text-xs transition-colors"
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors p-1 cursor-pointer focus:outline-hidden"
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
 
@@ -114,29 +123,17 @@ export const LoginView: React.FC = () => {
                 <span>प्रमाणीकरण जारी है...</span>
               ) : (
                 <>
-                  <span>कंसोल में प्रवेश करें (Sign In)</span>
+                  <span>सुरक्षित लॉगिन करें (Sign In Securely)</span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}
             </button>
           </form>
-
-          {/* 1-Click Fill Official Admin Credentials */}
-          <div className="mt-6 pt-5 border-t border-slate-800/80 text-center space-y-2">
-            <p className="text-[11px] text-slate-400">अधिकृत एडमिन क्रेडेंशियल (Official Admin Access):</p>
-            <button
-              type="button"
-              onClick={handleFillAdmin}
-              className="w-full py-2 px-3 bg-slate-800/80 hover:bg-slate-800 active:bg-slate-700 border border-slate-700/60 rounded-xl text-[11px] font-mono text-blue-300 transition-colors cursor-pointer flex items-center justify-center gap-2"
-            >
-              <span>Click to autofill: <strong>kritamk286@gmail.com</strong> / <strong>kritam@098only</strong></span>
-            </button>
-          </div>
         </div>
 
         {/* Security watermark */}
         <p className="text-center text-[11px] text-slate-600">
-          AK ENTERPRISES • Real-Time Database • Session Encrypted • IST (UTC+05:30)
+          AK ENTERPRISES • Real-Time Firestore Security • SSL/TLS Encrypted • IST (UTC+05:30)
         </p>
       </div>
     </div>

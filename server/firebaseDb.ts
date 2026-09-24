@@ -101,38 +101,38 @@ export async function initFirebaseDatabase() {
     }
 
     // 2. Check or seed Admin (configured for kritamk286@gmail.com)
-    const targetEmail = 'kritamk286@gmail.com';
-    const targetPass = 'kritam@098only';
+    const targetEmail = process.env.ADMIN_EMAIL || 'kritamk286@gmail.com';
+    const targetPass = process.env.ADMIN_PASSWORD || 'kritam@098only';
     const adminRef = doc(firestore, 'admins', 'admin_default');
-    const { hash } = hashPassword(targetPass);
+    const existingAdminSnap = await getDoc(adminRef);
 
-    await setDoc(
-      adminRef,
-      {
-        id: 'admin_default',
-        email: targetEmail,
-        name: 'Kritam (AK Enterprises)',
-        password_hash: hash,
-        role: 'superadmin',
-        updated_at: getISTTimestamp(),
-      },
-      { merge: true }
-    );
+    if (!existingAdminSnap.exists() || !existingAdminSnap.data()?.password_hash) {
+      const { hash } = hashPassword(targetPass);
+      await setDoc(
+        adminRef,
+        {
+          id: 'admin_default',
+          email: targetEmail,
+          name: 'Kritam (AK Enterprises)',
+          password_hash: hash,
+          role: 'superadmin',
+          created_at: getISTTimestamp(),
+          updated_at: getISTTimestamp(),
+        },
+        { merge: true }
+      );
+      console.log(`Firebase: Initialized secure admin account for ${targetEmail}.`);
+    } else {
+      console.log(`Firebase: Verified existing admin account for ${targetEmail}.`);
+    }
 
-    // Also update any matching admin docs and remove stale google auth docs
+    // Clean up any stale mock or temporary google auth docs
     const allAdmins = await getDocs(collection(firestore, 'admins'));
     for (const d of allAdmins.docs) {
-      if (d.data().email && d.data().email.toLowerCase() === targetEmail.toLowerCase()) {
-        await updateDoc(doc(firestore, 'admins', d.id), {
-          password_hash: hash,
-          name: 'Kritam (AK Enterprises)',
-          role: 'superadmin',
-        });
-      } else if (d.id.startsWith('admin_google_')) {
+      if (d.id.startsWith('admin_google_')) {
         await deleteDoc(doc(firestore, 'admins', d.id));
       }
     }
-    console.log(`Firebase: Synchronized admin account for ${targetEmail}.`);
   } catch (err) {
     console.error('Firebase initialization error:', err);
   }
